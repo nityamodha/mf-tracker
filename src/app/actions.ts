@@ -2,12 +2,12 @@
 
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { addHours } from "date-fns";
 
 import { createTaskSchema, taskAssignmentSchema, taskBulkUpdateSchema, taskCommentSchema, taskPrioritySchema, taskStatusSchema } from "@/lib/validators/task";
 import { createUserSchema, toggleUserSchema } from "@/lib/validators/user";
 import { loginSchema } from "@/lib/validators/auth";
 import { createSupabaseAdminClient } from "@/lib/supabase/server";
-import { getSlaDueAt } from "@/services/tasks";
 import { clearAppSession, createAppSession, getUserByEmail, requireAdmin, requireUser } from "@/services/auth";
 import type { Database } from "@/types/database";
 
@@ -25,6 +25,116 @@ function fail(error: unknown): ActionResult {
     success: false,
     error: error instanceof Error ? error.message : "Something went wrong.",
   };
+}
+
+function normalizeLabel(value?: string | null) {
+  return value?.trim() ?? "";
+}
+
+function slugify(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ".")
+    .replace(/(^\.|\.$)/g, "");
+}
+
+async function resolveOrCreateClient(name: string) {
+  const supabase = createSupabaseAdminClient();
+  const normalized = normalizeLabel(name);
+  if (!normalized) return null;
+
+  const { data: existing } = await supabase.from("clients").select("id").ilike("client_name", normalized).maybeSingle();
+  if (existing?.id) return existing.id;
+
+  const { data, error } = await supabase.from("clients").insert({ client_name: normalized }).select("id").single();
+  if (error) throw error;
+  return data.id;
+}
+
+async function resolveOrCreateChannelPartner(name: string, rmId?: string | null) {
+  const supabase = createSupabaseAdminClient();
+  const normalized = normalizeLabel(name);
+  if (!normalized) return null;
+
+  const { data: existing } = await supabase.from("channel_partners").select("id").ilike("partner_name", normalized).maybeSingle();
+  if (existing?.id) return existing.id;
+
+  const { data, error } = await supabase
+    .from("channel_partners")
+    .insert({ partner_name: normalized, rm_id: rmId ?? null })
+    .select("id")
+    .single();
+  if (error) throw error;
+  return data.id;
+}
+
+async function resolveOrCreateTaskType(name: string) {
+  const supabase = createSupabaseAdminClient();
+  const normalized = normalizeLabel(name);
+  if (!normalized) {
+    return { id: null, default_sla_hours: 24 };
+  }
+
+  const { data: existing } = await supabase.from("task_types").select("id, default_sla_hours").ilike("name", normalized).maybeSingle();
+  if (existing?.id) return existing;
+
+  const { data, error } = await supabase
+    .from("task_types")
+    .insert({ name: normalized, default_sla_hours: 24 })
+    .select("id, default_sla_hours")
+    .single();
+  if (error) throw error;
+  return data;
+}
+
+async function resolveOrCreateAmc(name: string) {
+  const supabase = createSupabaseAdminClient();
+  const normalized = normalizeLabel(name);
+  if (!normalized) return null;
+
+  const { data: existing } = await supabase.from("amcs").select("id").ilike("name", normalized).maybeSingle();
+  if (existing?.id) return existing.id;
+
+  const { data, error } = await supabase.from("amcs").insert({ name: normalized }).select("id").single();
+  if (error) throw error;
+  return data.id;
+}
+
+async function resolveOrCreateUser(nameOrEmail: string, role: Database["public"]["Enums"]["user_role"]) {
+  const supabase = createSupabaseAdminClient();
+  const normalized = normalizeLabel(nameOrEmail);
+  if (!normalized) return null;
+
+  const byEmailQuery = normalized.includes("@")
+    ? supabase.from("users").select("id").ilike("email", normalized).maybeSingle()
+    : Promise.resolve({ data: null as { id: string } | null });
+  const byNameQuery = supabase.from("users").select("id").ilike("full_name", normalized).maybeSingle();
+
+  const [{ data: byEmail }, { data: byName }] = await Promise.all([byEmailQuery, byNameQuery]);
+  if (byEmail?.id) return byEmail.id;
+  if (byName?.id) return byName.id;
+
+  const derivedEmail = normalized.includes("@")
+    ? normalized.toLowerCase()
+    : `${slugify(normalized) || "user"}.${Date.now()}@mftracker.local`;
+
+  const fullName = normalized.includes("@") ? normalized.split("@")[0].replace(/[._-]+/g, " ") : normalized;
+
+  const { data, error } = await supabase
+    .from("users")
+    .insert({
+      id: crypto.randomUUID(),
+      full_name: fullName.replace(/\b\w/g, (char) => char.toUpperCase()),
+      email: derivedEmail,
+      password: "",
+      role,
+      team: null,
+      is_active: true,
+    })
+    .select("id")
+    .single();
+  if (error) throw error;
+  return data.id;
 }
 
 export async function loginAction(input: unknown): Promise<ActionResult> {
@@ -52,17 +162,31 @@ export async function createTaskAction(input: unknown): Promise<ActionResult> {
     const { profile } = await requireUser();
     const values = createTaskSchema.parse(input);
     const supabase = createSupabaseAdminClient();
+    const [clientId, rmId, assignedToId, taskType, amcId] = await Promise.all([
+      resolveOrCreateClient(values.client_name),
+      resolveOrCreateUser(values.rm_name, "rm"),
+      resolveOrCreateUser(values.assigned_to_name, "mid_office"),
+      resolveOrCreateTaskType(values.task_type_name),
+      resolveOrCreateAmc(values.amc_name),
+    ]);
+    const channelPartnerId = await resolveOrCreateChannelPartner(values.channel_partner_name, rmId);
 
-    const { data: taskType, error: taskTypeError } = await supabase.from("task_types").select("*").eq("id", values.task_type_id).single();
-    if (taskTypeError || !taskType) throw new Error("Unable to resolve task type SLA.");
+    const slaBase = values.due_date ? new Date(values.due_date) : new Date();
+    const dueDate = values.due_date ? new Date(values.due_date).toISOString() : null;
 
     const payload: Database["public"]["Tables"]["tasks"]["Insert"] = {
-      ...values,
-      channel_partner_id: values.channel_partner_id || null,
-      amc_id: values.amc_id || null,
+      client_id: clientId,
+      channel_partner_id: channelPartnerId,
+      rm_id: rmId,
+      assigned_to: assignedToId ?? profile.id,
+      task_type_id: taskType.id,
+      amc_id: amcId,
+      priority: values.priority,
+      due_date: dueDate,
+      description: normalizeLabel(values.description) || null,
       created_by: profile.id,
       status: "new_request" as const,
-      sla_due_at: getSlaDueAt(taskType.default_sla_hours, values.due_date),
+      sla_due_at: addHours(slaBase, taskType.default_sla_hours ?? 24).toISOString(),
     };
 
     const { error } = await supabase.from("tasks").insert(payload);

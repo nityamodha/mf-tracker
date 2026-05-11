@@ -39,7 +39,7 @@ export async function getTaskLookups() {
   const [{ data: clients }, { data: channelPartners }, { data: users }, { data: amcs }, { data: taskTypes }] = await Promise.all([
     supabase.from("clients").select("*").order("client_name"),
     supabase.from("channel_partners").select("*").order("partner_name"),
-    supabase.from("users").select("*").eq("is_active", true).order("full_name"),
+    supabase.from("users").select("id, full_name, email, role, team, is_active, created_at").eq("is_active", true).order("full_name"),
     supabase.from("amcs").select("*").order("name"),
     supabase.from("task_types").select("*").order("name"),
   ]);
